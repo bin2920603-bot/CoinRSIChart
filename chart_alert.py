@@ -15,8 +15,8 @@ VOL_MIN_ELAPSED = 0.1
 VOL_WEAK = 0.7
 VOL_STRONG = 2.0
 VOL_RISING = 1.5
-BARS = [("1H", "1시간봉"), ("2H", "2시간봉"), ("4H", "4시간봉"), ("1D", "일봉")]
-BAR_MS = {"1H": 3600000, "2H": 7200000, "4H": 14400000, "1D": 86400000}
+BARS = [("1H", "1시간봉"), ("2H", "2시간봉"), ("4H", "4시간봉"), ("1D", "일봉"), ("1W", "주봉"), ("1M", "월봉")]
+BAR_MS = {"1H": 3600000, "2H": 7200000, "4H": 14400000, "1D": 86400000, "1W": 604800000, "1M": 2592000000}
 STATE = "state/sent.json"
 
 
@@ -52,6 +52,40 @@ def ema(values, n):
         e = v * k + e * (1 - k)
         out.append(e)
     return out
+
+
+def ema_full(values, n):
+    """첫 값부터 시작하는 EMA (길이가 입력과 같다). MACD용."""
+    k = 2 / (n + 1)
+    e = values[0]
+    out = [e]
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
+        out.append(e)
+    return out
+
+
+def macd(closes):
+    """(DIF, DEA, 히스토그램) 목록. OKX 기본 12·26·9, 히스토그램은 2*(DIF-DEA)."""
+    if len(closes) < 35:
+        return None, None, None
+    e12 = ema_full(closes, 12)
+    e26 = ema_full(closes, 26)
+    dif = [a - b for a, b in zip(e12, e26)]
+    dea = ema_full(dif, 9)
+    hist = [2 * (a - b) for a, b in zip(dif, dea)]
+    return dif, dea, hist
+
+
+def macd_text(closes):
+    dif, dea, hist = macd(closes)
+    if dif is None:
+        return "MACD -"
+    t = "MACD " + ("0선 위" if dif[-1] > 0 else "0선 아래")
+    t += " · " + ("DIF가 DEA 위 📈" if dif[-1] > dea[-1] else "DIF가 DEA 아래 📉")
+    if len(hist) >= 2:
+        t += " · " + ("막대 회복 중" if hist[-1] > hist[-2] else "막대 약해지는 중")
+    return t
 
 
 def vol_info(cs, bar, now):
@@ -96,19 +130,20 @@ def make_chart(cs, closes, name, bar, kind, path):
 
         n = len(cs)
         idx = list(range(max(0, n - CHART_BARS), n))
-        fig = plt.figure(figsize=(8, 7), facecolor="#0b0e11")
-        gs = GridSpec(3, 1, height_ratios=[4, 1.4, 1.2], hspace=0.08)
+        fig = plt.figure(figsize=(8, 8.5), facecolor="#0b0e11")
+        gs = GridSpec(4, 1, height_ratios=[4, 1.4, 1.4, 1.1], hspace=0.08)
         ax1 = fig.add_subplot(gs[0])
         ax2 = fig.add_subplot(gs[1], sharex=ax1)
         ax3 = fig.add_subplot(gs[2], sharex=ax1)
-        for ax in (ax1, ax2, ax3):
+        ax4 = fig.add_subplot(gs[3], sharex=ax1)
+        for ax in (ax1, ax2, ax3, ax4):
             ax.set_facecolor("#0b0e11")
             ax.tick_params(colors="#9aa0a6", labelsize=8)
             for sp in ax.spines.values():
                 sp.set_color("#2a2e35")
             ax.grid(color="#1e2229", lw=0.5)
-        plt.setp(ax1.get_xticklabels(), visible=False)
-        plt.setp(ax2.get_xticklabels(), visible=False)
+        for ax in (ax1, ax2, ax3):
+            plt.setp(ax.get_xticklabels(), visible=False)
 
         lo_all, hi_all = None, None
         for i in idx:
@@ -118,7 +153,7 @@ def make_chart(cs, closes, name, bar, kind, path):
             ax1.plot([i, i], [l, h], color=col, lw=1)
             body = max(abs(c - o), (h - l) * 0.02, 1e-12)
             ax1.bar(i, body, bottom=min(o, c), width=0.7, color=col)
-            ax3.bar(i, float(cs[i][7]), width=0.7, color=col)
+            ax4.bar(i, float(cs[i][7]), width=0.7, color=col)
             lo_all = l if lo_all is None else min(lo_all, l)
             hi_all = h if hi_all is None else max(hi_all, h)
 
@@ -136,15 +171,26 @@ def make_chart(cs, closes, name, bar, kind, path):
             m = (hi_all - lo_all) * 0.06
             ax1.set_ylim(lo_all - m, hi_all + m)
 
+        dif, dea, hist = macd(closes)
+        if dif is not None:
+            for i in idx:
+                hc = "#26a69a" if hist[i] >= 0 else "#ef5350"
+                ax2.bar(i, hist[i], width=0.7, color=hc)
+            ax2.plot(idx, [dif[i] for i in idx], color="#42a5f5", lw=1.2)
+            ax2.plot(idx, [dea[i] for i in idx], color="#ffd54f", lw=1.2)
+            ax2.axhline(0, color="#5f6368", lw=0.8)
+        ax2.text(0.01, 0.80, "MACD 12-26-9  (blue=DIF, yellow=DEA)", transform=ax2.transAxes,
+                 color="#9aa0a6", fontsize=8)
+
         r6 = rsi(closes, 6)
         r6 = [None] * (n - len(r6)) + r6
         xs = [i for i in idx if r6[i] is not None]
-        ax2.plot(xs, [r6[i] for i in xs], color="#ffb74d", lw=1.3)
-        ax2.axhline(30, color="#42a5f5", ls="--", lw=1)
-        ax2.axhline(70, color="#42a5f5", ls="--", lw=0.8)
-        ax2.set_ylim(0, 100)
-        ax2.text(0.01, 0.82, "RSI6", transform=ax2.transAxes, color="#ffb74d", fontsize=8)
-        ax3.text(0.01, 0.78, "Volume", transform=ax3.transAxes, color="#9aa0a6", fontsize=8)
+        ax3.plot(xs, [r6[i] for i in xs], color="#ffb74d", lw=1.3)
+        ax3.axhline(30, color="#42a5f5", ls="--", lw=1)
+        ax3.axhline(70, color="#42a5f5", ls="--", lw=0.8)
+        ax3.set_ylim(0, 100)
+        ax3.text(0.01, 0.82, "RSI6", transform=ax3.transAxes, color="#ffb74d", fontsize=8)
+        ax4.text(0.01, 0.78, "Volume", transform=ax4.transAxes, color="#9aa0a6", fontsize=8)
 
         title = "RSI 30 NEAR" if kind == "near" else "RSI 30 CROSS"
         fig.suptitle(name + "  " + bar + "  -  " + title, color="#e8eaed", fontsize=12, y=0.93)
@@ -247,7 +293,8 @@ def main():
             head = "🟡 RSI 30 임박 (아직 안 뚫음)" if kind == "near" else "🟢 RSI 30 돌파"
             cap = (head + NL + "<b>▶ " + name + "</b> · " + label + "·진행중" + NL
                    + "RSI6 " + format(prev_r, ".1f") + " → " + format(now_r, ".1f") + NL
-                   + vol_text(vp, vx))
+                   + vol_text(vp, vx) + NL
+                   + macd_text(closes))
             png = make_chart(cs, closes, name, bar, kind, "/tmp/" + name + "_" + bar + "_" + kind + ".png")
             if png:
                 send_photo(token, chat, png, cap)
