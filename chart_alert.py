@@ -6,7 +6,11 @@ TOP_N = 100
 LOW = 30
 NEAR_MIN = 25
 RSI_MAX = 40
+HIGH = 70              # 숏: RSI 70 기준
+NEAR_MAX = 75          # 숏 임박: RSI 70~75
+RSI_MIN_S = 60         # 숏: 꺾인 뒤 RSI가 이 값 이상
 LIVE_MIN_CHG = 0.5
+LIVE_MIN_CHG_S = 0.5   # 숏: 이번 봉이 이만큼(%) 이상 내려갈 때
 RSI_N = 6
 CHART_BARS = 80
 MAX_ALERTS = 12
@@ -15,15 +19,27 @@ VOL_MIN_ELAPSED = 0.1
 VOL_WEAK = 0.7
 VOL_STRONG = 2.0
 VOL_RISING = 1.5
-TURN_THIN = 100000     # 봉 거래대금이 이 값(USDT) 미만이면 얇음
-TURN_BIG = 10000000    # 봉 거래대금이 이 값(USDT) 이상이면 큼
-CHK_VOL = 1.5          # 진입체크: 거래량 평균 ×이 값 이상
-CHK_TURN = 1000000     # 진입체크: 봉 거래대금(USDT) 이 값 이상
-CHK_STOP = 3           # 진입체크: 최근 저점까지 이 % 이내
-STOP_BARS = 10         # 손절 기준: 최근 몇 봉의 저점
+TURN_THIN = 100000
+TURN_BIG = 10000000
+CHK_VOL = 1.5
+CHK_TURN = 1000000
+CHK_STOP = 3
+STOP_BARS = 10
 BARS = [("1H", "1시간봉"), ("2H", "2시간봉"), ("4H", "4시간봉"), ("1D", "일봉"), ("1W", "주봉"), ("1M", "월봉")]
 BAR_MS = {"1H": 3600000, "2H": 7200000, "4H": 14400000, "1D": 86400000, "1W": 604800000, "1M": 2592000000}
 STATE = "state/sent.json"
+HEADS = {
+    "cross": "🟢 롱 · RSI 30 돌파",
+    "near": "🟡 롱 · RSI 30 임박 (아직 안 뚫음)",
+    "scross": "🔻 숏 · RSI 70 하향 이탈",
+    "snear": "🟠 숏 · RSI 70 임박 (위에서 꺾이는 중, 아직 70 위)",
+}
+TITLES = {
+    "cross": "RSI 30 CROSS",
+    "near": "RSI 30 NEAR",
+    "scross": "RSI 70 BREAKDOWN (SHORT)",
+    "snear": "RSI 70 NEAR (SHORT)",
+}
 
 
 def get(path, params=None):
@@ -163,11 +179,10 @@ def turn_text(est, day_turn):
 
 
 def entry_check(cs, closes, now_r, vx, est):
-    """진입 체크 3개. (전체 통과 여부, 줄 목록)"""
+    """롱 진입 체크 3개. (전체 통과 여부, 줄 목록)"""
     lines = []
     ok_all = True
 
-    # 체크 1: RSI6이 30 위 + 가격이 EMA7 위
     e7 = ema(closes, 7)
     why = []
     if now_r <= LOW:
@@ -180,7 +195,6 @@ def entry_check(cs, closes, now_r, vx, est):
     else:
         lines.append(" ✔ RSI 30 위 · EMA7 위")
 
-    # 체크 2: 거래량 + 거래대금
     why = []
     if vx is None or vx < CHK_VOL:
         why.append("거래량 " + ("-" if vx is None else "×" + format(vx, ".1f")))
@@ -192,7 +206,6 @@ def entry_check(cs, closes, now_r, vx, est):
     else:
         lines.append(" ✔ 거래량 ×" + format(vx, ".1f") + " · 거래대금 " + fmt_usdt(est))
 
-    # 체크 3: 최근 저점까지 거리
     try:
         price = closes[-1]
         low_n = min(float(x[3]) for x in cs[-1 - STOP_BARS:-1])
@@ -205,6 +218,53 @@ def entry_check(cs, closes, now_r, vx, est):
             lines.append(" ✘ 손절폭 큼: " + format(pct, ".1f") + "% (" + str(CHK_STOP) + "% 넘음)")
         else:
             lines.append(" ✔ 손절 " + format(pct, ".1f") + "% (" + str(CHK_STOP) + "% 이내)")
+    except Exception:
+        ok_all = False
+        lines.append(" ✘ 손절 계산 불가")
+
+    return ok_all, lines
+
+
+def entry_check_short(cs, closes, now_r, vx, est):
+    """숏 진입 체크 3개. (전체 통과 여부, 줄 목록)"""
+    lines = []
+    ok_all = True
+
+    e7 = ema(closes, 7)
+    why = []
+    if now_r >= HIGH:
+        why.append("RSI 70 아래로 못 내려옴")
+    if e7 and closes[-1] >= e7[-1]:
+        why.append("가격이 EMA7 위")
+    if why:
+        ok_all = False
+        lines.append(" ✘ 마감 확인: " + ", ".join(why))
+    else:
+        lines.append(" ✔ RSI 70 아래 · EMA7 아래")
+
+    why = []
+    if vx is None or vx < CHK_VOL:
+        why.append("거래량 " + ("-" if vx is None else "×" + format(vx, ".1f")))
+    if est is None or est < CHK_TURN:
+        why.append("거래대금 " + ("-" if est is None else fmt_usdt(est)))
+    if why:
+        ok_all = False
+        lines.append(" ✘ 힘 부족: " + ", ".join(why))
+    else:
+        lines.append(" ✔ 거래량 ×" + format(vx, ".1f") + " · 거래대금 " + fmt_usdt(est))
+
+    try:
+        price = closes[-1]
+        high_n = max(float(x[2]) for x in cs[-1 - STOP_BARS:-1])
+        pct = (high_n / price - 1) * 100
+        if high_n <= price:
+            ok_all = False
+            lines.append(" ✘ 손절: 고점이 가격 아래 (계산 불가)")
+        elif pct >= CHK_STOP:
+            ok_all = False
+            lines.append(" ✘ 손절폭 큼: " + format(pct, "+.1f") + "% (" + str(CHK_STOP) + "% 넘음)")
+        else:
+            lines.append(" ✔ 손절 " + format(pct, "+.1f") + "% (" + str(CHK_STOP) + "% 이내)")
     except Exception:
         ok_all = False
         lines.append(" ✘ 손절 계산 불가")
@@ -278,12 +338,12 @@ def make_chart(cs, closes, name, bar, kind, path):
         xs = [i for i in idx if r6[i] is not None]
         ax3.plot(xs, [r6[i] for i in xs], color="#ffb74d", lw=1.3)
         ax3.axhline(30, color="#42a5f5", ls="--", lw=1)
-        ax3.axhline(70, color="#42a5f5", ls="--", lw=0.8)
+        ax3.axhline(70, color="#42a5f5", ls="--", lw=1)
         ax3.set_ylim(0, 100)
         ax3.text(0.01, 0.82, "RSI6", transform=ax3.transAxes, color="#ffb74d", fontsize=8)
         ax4.text(0.01, 0.78, "Volume", transform=ax4.transAxes, color="#9aa0a6", fontsize=8)
 
-        title = "RSI 30 NEAR" if kind == "near" else "RSI 30 CROSS"
+        title = TITLES.get(kind, "RSI")
         fig.suptitle(name + "  " + bar + "  -  " + title, color="#e8eaed", fontsize=12, y=0.93)
         fig.savefig(path, dpi=100, facecolor=fig.get_facecolor(), bbox_inches="tight")
         plt.close(fig)
@@ -341,7 +401,7 @@ def main():
 
     count = 0
     if first:
-        send_text(token, chat, "✅ RSI차트알림이 켜졌어요. 🟡30임박·🟢30돌파 코인이 나오면 차트 사진으로 알려 드려요.")
+        send_text(token, chat, "✅ RSI차트알림이 켜졌어요. 🟢롱(30임박·30돌파)·🔻숏(70임박·70하향이탈) 코인이 나오면 차트 사진으로 알려 드려요.")
 
     for vol, inst in rows[:TOP_N]:
         if count >= MAX_ALERTS:
@@ -376,6 +436,10 @@ def main():
                 kind = "cross"
             elif NEAR_MIN <= now_r <= LOW and now_r > prev_r:
                 kind = "near"
+            elif prev_r >= HIGH > now_r >= RSI_MIN_S and chg <= -LIVE_MIN_CHG_S:
+                kind = "scross"
+            elif HIGH <= now_r <= NEAR_MAX and now_r < prev_r:
+                kind = "snear"
             if not kind:
                 continue
 
@@ -385,9 +449,14 @@ def main():
 
             vp, vx = vol_info(cs, bar, now)
             est = turn_info(cs, bar, now)
-            ok, chk_lines = entry_check(cs, closes, now_r, vx, est)
-            chk_head = "🧭 진입 체크: " + ("✅진입 후보 (마감 뒤 다시 확인)" if ok else "❌패스")
-            head = "🟡 RSI 30 임박 (아직 안 뚫음)" if kind == "near" else "🟢 RSI 30 돌파"
+            is_short = kind in ("scross", "snear")
+            if is_short:
+                ok, chk_lines = entry_check_short(cs, closes, now_r, vx, est)
+                chk_head = "🧭 숏 진입 체크: " + ("✅숏 후보 (마감 뒤 다시 확인)" if ok else "❌패스")
+            else:
+                ok, chk_lines = entry_check(cs, closes, now_r, vx, est)
+                chk_head = "🧭 롱 진입 체크: " + ("✅롱 후보 (마감 뒤 다시 확인)" if ok else "❌패스")
+            head = HEADS[kind]
             cap = (head + NL + "<b>▶ " + name + "</b> · " + label + "·진행중" + NL
                    + "RSI6 " + format(prev_r, ".1f") + " → " + format(now_r, ".1f") + NL
                    + vol_text(vp, vx) + NL
