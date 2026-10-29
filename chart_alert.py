@@ -1,14 +1,15 @@
 import os, json, time, requests
 
 OKX = "https://www.okx.com"
-TOP_N = 100            # 거래대금 상위 몇 개를 볼지
-LOW = 30               # RSI 30 기준선
-NEAR_MIN = 25          # 🟡임박: RSI6이 이 값 이상 ~ 30 이하이고 올라오는 중
-RSI_MAX = 40           # 🟢돌파: 뚫은 뒤 RSI6이 이 값 이하일 때만
-LIVE_MIN_CHG = 0.5     # 🟢돌파: 이번 봉이 이 % 이상 올랐을 때만
-RSI_N = 6              # RSI6
-CHART_BARS = 80        # 사진에 그릴 봉 개수
-MAX_ALERTS = 12        # 한 번 실행에 보낼 알림 최대 개수 (넘치면 다음 실행에 이어서)
+NL = chr(10)           # 줄바꿈
+TOP_N = 100
+LOW = 30
+NEAR_MIN = 25
+RSI_MAX = 40
+LIVE_MIN_CHG = 0.5
+RSI_N = 6
+CHART_BARS = 80
+MAX_ALERTS = 12
 VOL_AVG_BARS = 20
 VOL_MIN_ELAPSED = 0.1
 VOL_WEAK = 0.7
@@ -54,7 +55,6 @@ def ema(values, n):
 
 
 def vol_info(cs, bar, now):
-    """(직전 봉 대비 %, 최근 20봉 평균 대비 ×배). 진행중 봉은 봉 전체 길이로 환산."""
     try:
         cur = float(cs[-1][7])
         prev = float(cs[-2][7])
@@ -75,9 +75,9 @@ def vol_info(cs, bar, now):
 def vol_text(pct, x):
     if x is None:
         return "거래량 - (봉이 막 시작해서 아직 계산 불가)"
-    t = f"{'🔴' if (pct or 0) >= 0 else '🔵'}거래량 평균 ×{x:.1f}"
+    t = ("🔴" if (pct or 0) >= 0 else "🔵") + "거래량 평균 ×" + format(x, ".1f")
     if pct is not None:
-        t += f" (직전 {pct:+.0f}%)"
+        t += " (직전 " + format(pct, "+.0f") + "%)"
     if x < VOL_WEAK:
         t += " ⚠️약함"
     elif x >= VOL_STRONG:
@@ -88,7 +88,6 @@ def vol_text(pct, x):
 
 
 def make_chart(cs, closes, name, bar, kind, path):
-    """캔들 + EMA7/20/50/200 + RSI6(30선) + 거래량 사진. 실패하면 None."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -130,7 +129,7 @@ def make_chart(cs, closes, name, bar, kind, path):
             e = [None] * (n - len(e)) + e
             xs = [i for i in idx if e[i] is not None]
             if xs:
-                ax1.plot(xs, [e[i] for i in xs], color=colr, lw=1.2, label=f"EMA{k}")
+                ax1.plot(xs, [e[i] for i in xs], color=colr, lw=1.2, label="EMA" + str(k))
         ax1.legend(loc="upper left", fontsize=7, facecolor="#0b0e11",
                    edgecolor="#2a2e35", labelcolor="#cfd3d8", ncol=4)
         if lo_all is not None and hi_all > lo_all:
@@ -148,7 +147,7 @@ def make_chart(cs, closes, name, bar, kind, path):
         ax3.text(0.01, 0.78, "Volume", transform=ax3.transAxes, color="#9aa0a6", fontsize=8)
 
         title = "RSI 30 NEAR" if kind == "near" else "RSI 30 CROSS"
-        fig.suptitle(f"{name}  {bar}  -  {title}", color="#e8eaed", fontsize=12, y=0.93)
+        fig.suptitle(name + "  " + bar + "  -  " + title, color="#e8eaed", fontsize=12, y=0.93)
         fig.savefig(path, dpi=100, facecolor=fig.get_facecolor(), bbox_inches="tight")
         plt.close(fig)
         return path
@@ -157,7 +156,117 @@ def make_chart(cs, closes, name, bar, kind, path):
 
 
 def send_text(token, chat, text):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    url = "https://api.telegram.org/bot" + token + "/sendMessage"
     try:
         r = requests.post(url, data={"chat_id": chat, "text": text,
-                                     "parse
+                                     "parse_mode": "HTML"}, timeout=15)
+        if r.status_code == 200:
+            return
+    except Exception:
+        pass
+    plain = text.replace("<b>", "").replace("</b>", "")
+    requests.post(url, data={"chat_id": chat, "text": plain}, timeout=15)
+
+
+def send_photo(token, chat, path, caption):
+    url = "https://api.telegram.org/bot" + token + "/sendPhoto"
+    try:
+        with open(path, "rb") as f:
+            r = requests.post(url, data={"chat_id": chat, "caption": caption[:1000],
+                                         "parse_mode": "HTML"},
+                              files={"photo": f}, timeout=30)
+        if r.status_code == 200:
+            return
+    except Exception:
+        pass
+    send_text(token, chat, caption)
+
+
+def main():
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    chat = os.environ["TELEGRAM_CHAT_ID"]
+    first = not os.path.exists(STATE)
+    sent = {} if first else json.load(open(STATE))
+    now = int(time.time() * 1000)
+
+    rows = []
+    for t in get("/api/v5/market/tickers", {"instType": "SWAP"}):
+        if not t["instId"].endswith("-USDT-SWAP"):
+            continue
+        try:
+            rows.append((float(t["volCcy24h"]) * float(t["last"]), t["instId"]))
+        except ValueError:
+            pass
+    rows.sort(reverse=True)
+
+    count = 0
+    if first:
+        send_text(token, chat, "✅ RSI차트알림이 켜졌어요. 🟡30임박·🟢30돌파 코인이 나오면 차트 사진으로 알려 드려요.")
+
+    for vol, inst in rows[:TOP_N]:
+        if count >= MAX_ALERTS:
+            break
+        name = inst.replace("-USDT-SWAP", "")
+        for bar, label in BARS:
+            if count >= MAX_ALERTS:
+                break
+            time.sleep(0.15)
+            try:
+                c = get("/api/v5/market/candles",
+                        {"instId": inst, "bar": bar, "limit": "300"})
+            except Exception:
+                continue
+            if not c or c[0][8] != "0":
+                continue
+            live = c[0]
+            done = [x for x in c if x[8] == "1"][::-1]
+            if len(done) < 30:
+                continue
+            cs = done + [live]
+            closes = [float(x[4]) for x in cs]
+            r = rsi(closes, RSI_N)
+            if len(r) < 2:
+                continue
+            now_r, prev_r = r[-1], r[-2]
+            o = float(live[1])
+            chg = (closes[-1] / o - 1) * 100 if o else 0
+
+            kind = None
+            if prev_r <= LOW < now_r <= RSI_MAX and chg >= LIVE_MIN_CHG:
+                kind = "cross"
+            elif NEAR_MIN <= now_r <= LOW and now_r > prev_r:
+                kind = "near"
+            if not kind:
+                continue
+
+            key = inst + "|" + bar + "|" + kind
+            if sent.get(key) == live[0]:
+                continue
+
+            vp, vx = vol_info(cs, bar, now)
+            head = "🟡 RSI 30 임박 (아직 안 뚫음)" if kind == "near" else "🟢 RSI 30 돌파"
+            cap = (head + NL + "<b>▶ " + name + "</b> · " + label + "·진행중" + NL
+                   + "RSI6 " + format(prev_r, ".1f") + " → " + format(now_r, ".1f") + NL
+                   + vol_text(vp, vx))
+            png = make_chart(cs, closes, name, bar, kind, "/tmp/" + name + "_" + bar + "_" + kind + ".png")
+            if png:
+                send_photo(token, chat, png, cap)
+            else:
+                send_text(token, chat, cap)
+            sent[key] = live[0]
+            count += 1
+            time.sleep(1)
+
+    keep = {}
+    for k, v in sent.items():
+        try:
+            if int(v) > now - 3 * 86400000:
+                keep[k] = v
+        except Exception:
+            pass
+    os.makedirs("state", exist_ok=True)
+    json.dump(keep, open(STATE, "w"))
+
+
+if __name__ == "__main__":
+    main()
