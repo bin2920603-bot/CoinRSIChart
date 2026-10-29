@@ -15,6 +15,12 @@ VOL_MIN_ELAPSED = 0.1
 VOL_WEAK = 0.7
 VOL_STRONG = 2.0
 VOL_RISING = 1.5
+TURN_THIN = 100000     # 봉 거래대금이 이 값(USDT) 미만이면 얇음
+TURN_BIG = 10000000    # 봉 거래대금이 이 값(USDT) 이상이면 큼
+CHK_VOL = 1.5          # 진입체크: 거래량 평균 ×이 값 이상
+CHK_TURN = 1000000     # 진입체크: 봉 거래대금(USDT) 이 값 이상
+CHK_STOP = 3           # 진입체크: 최근 저점까지 이 % 이내
+STOP_BARS = 10         # 손절 기준: 최근 몇 봉의 저점
 BARS = [("1H", "1시간봉"), ("2H", "2시간봉"), ("4H", "4시간봉"), ("1D", "일봉"), ("1W", "주봉"), ("1M", "월봉")]
 BAR_MS = {"1H": 3600000, "2H": 7200000, "4H": 14400000, "1D": 86400000, "1W": 604800000, "1M": 2592000000}
 STATE = "state/sent.json"
@@ -55,7 +61,6 @@ def ema(values, n):
 
 
 def ema_full(values, n):
-    """첫 값부터 시작하는 EMA (길이가 입력과 같다). MACD용."""
     k = 2 / (n + 1)
     e = values[0]
     out = [e]
@@ -66,7 +71,6 @@ def ema_full(values, n):
 
 
 def macd(closes):
-    """(DIF, DEA, 히스토그램) 목록. OKX 기본 12·26·9, 히스토그램은 2*(DIF-DEA)."""
     if len(closes) < 35:
         return None, None, None
     e12 = ema_full(closes, 12)
@@ -119,6 +123,93 @@ def vol_text(pct, x):
     elif x >= VOL_RISING and pct is not None and pct >= 0:
         t += " 📈늘어나는 중"
     return t
+
+
+def fmt_usdt(v):
+    if v >= 100000000:
+        return format(v / 100000000, ".1f") + "억"
+    if v >= 10000:
+        return format(v / 10000, ",.0f") + "만"
+    return format(v, ",.0f")
+
+
+def turn_info(cs, bar, now):
+    """이번 봉 거래대금(USDT) 추정값. 계산 못 하면 None."""
+    try:
+        o = float(cs[-1][1]); h = float(cs[-1][2]); l = float(cs[-1][3]); c = float(cs[-1][4])
+        avg_price = (o + h + l + c) / 4
+        cur = float(cs[-1][6]) if len(cs[-1]) > 6 and float(cs[-1][6]) > 0 else float(cs[-1][7]) * avg_price
+        dur = BAR_MS[bar]
+        elapsed = now - int(cs[-1][0])
+        if elapsed < dur * VOL_MIN_ELAPSED:
+            return None
+        return cur * dur / min(elapsed, dur)
+    except Exception:
+        return None
+
+
+def turn_text(est, day_turn):
+    if est is None:
+        return "💰거래대금 - (봉이 막 시작해서 아직 계산 불가)"
+    grade = ""
+    if est < TURN_THIN:
+        grade = " ⚠️얇음"
+    elif est >= TURN_BIG:
+        grade = " 🔥큼"
+    t = "💰이번 봉 거래대금 약 " + fmt_usdt(est) + " USDT" + grade
+    if day_turn:
+        t += " (24시간 " + fmt_usdt(day_turn) + ")"
+    return t
+
+
+def entry_check(cs, closes, now_r, vx, est):
+    """진입 체크 3개. (전체 통과 여부, 줄 목록)"""
+    lines = []
+    ok_all = True
+
+    # 체크 1: RSI6이 30 위 + 가격이 EMA7 위
+    e7 = ema(closes, 7)
+    why = []
+    if now_r <= LOW:
+        why.append("RSI 30 못 넘음")
+    if e7 and closes[-1] <= e7[-1]:
+        why.append("가격이 EMA7 아래")
+    if why:
+        ok_all = False
+        lines.append(" ✘ 마감 확인: " + ", ".join(why))
+    else:
+        lines.append(" ✔ RSI 30 위 · EMA7 위")
+
+    # 체크 2: 거래량 + 거래대금
+    why = []
+    if vx is None or vx < CHK_VOL:
+        why.append("거래량 " + ("-" if vx is None else "×" + format(vx, ".1f")))
+    if est is None or est < CHK_TURN:
+        why.append("거래대금 " + ("-" if est is None else fmt_usdt(est)))
+    if why:
+        ok_all = False
+        lines.append(" ✘ 힘 부족: " + ", ".join(why))
+    else:
+        lines.append(" ✔ 거래량 ×" + format(vx, ".1f") + " · 거래대금 " + fmt_usdt(est))
+
+    # 체크 3: 최근 저점까지 거리
+    try:
+        price = closes[-1]
+        low_n = min(float(x[3]) for x in cs[-1 - STOP_BARS:-1])
+        pct = (low_n / price - 1) * 100
+        if low_n >= price:
+            ok_all = False
+            lines.append(" ✘ 손절: 저점이 가격 위 (계산 불가)")
+        elif pct <= -CHK_STOP:
+            ok_all = False
+            lines.append(" ✘ 손절폭 큼: " + format(pct, ".1f") + "% (" + str(CHK_STOP) + "% 넘음)")
+        else:
+            lines.append(" ✔ 손절 " + format(pct, ".1f") + "% (" + str(CHK_STOP) + "% 이내)")
+    except Exception:
+        ok_all = False
+        lines.append(" ✘ 손절 계산 불가")
+
+    return ok_all, lines
 
 
 def make_chart(cs, closes, name, bar, kind, path):
@@ -236,11 +327,14 @@ def main():
     now = int(time.time() * 1000)
 
     rows = []
+    day_turn = {}
     for t in get("/api/v5/market/tickers", {"instType": "SWAP"}):
         if not t["instId"].endswith("-USDT-SWAP"):
             continue
         try:
-            rows.append((float(t["volCcy24h"]) * float(t["last"]), t["instId"]))
+            tv = float(t["volCcy24h"]) * float(t["last"])
+            rows.append((tv, t["instId"]))
+            day_turn[t["instId"]] = tv
         except ValueError:
             pass
     rows.sort(reverse=True)
@@ -290,11 +384,16 @@ def main():
                 continue
 
             vp, vx = vol_info(cs, bar, now)
+            est = turn_info(cs, bar, now)
+            ok, chk_lines = entry_check(cs, closes, now_r, vx, est)
+            chk_head = "🧭 진입 체크: " + ("✅진입 후보 (마감 뒤 다시 확인)" if ok else "❌패스")
             head = "🟡 RSI 30 임박 (아직 안 뚫음)" if kind == "near" else "🟢 RSI 30 돌파"
             cap = (head + NL + "<b>▶ " + name + "</b> · " + label + "·진행중" + NL
                    + "RSI6 " + format(prev_r, ".1f") + " → " + format(now_r, ".1f") + NL
                    + vol_text(vp, vx) + NL
-                   + macd_text(closes))
+                   + turn_text(est, day_turn.get(inst)) + NL
+                   + macd_text(closes) + NL
+                   + chk_head + NL + NL.join(chk_lines))
             png = make_chart(cs, closes, name, bar, kind, "/tmp/" + name + "_" + bar + "_" + kind + ".png")
             if png:
                 send_photo(token, chat, png, cap)
